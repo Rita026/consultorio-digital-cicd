@@ -65,3 +65,9 @@ db.sqlite
 Dockerfile
 nginx.conf
 .dockerignore
+# Generado por scripts/generar-entorno.sh (pipeline CI/CD)
+public/version.json
+.vercel
+
+.vercel
+.env*
