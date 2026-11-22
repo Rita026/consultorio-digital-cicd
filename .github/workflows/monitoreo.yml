@@ -1,0 +1,47 @@
+# =============================================================================
+# Monitoreo de producción — Consultorio Digital
+# Cada hora revisa que producción esté disponible y responda a tiempo.
+# Si una revisión falla, GitHub marca el workflow en rojo y avisa por correo
+# a la persona dueña del repositorio. Las métricas se guardan como artefacto
+# y en el resumen de cada ejecución.
+# =============================================================================
+name: Monitoreo de producción
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # cada hora, minuto 17 (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  revisar-produccion:
+    name: Revisión de disponibilidad y rendimiento
+    if: ${{ vars.PRODUCTION_URL != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Pruebas de humo en producción
+        run: bash scripts/pruebas-humo.sh "${{ vars.PRODUCTION_URL }}"
+        env:
+          AMBIENTE_ESPERADO: production
+          REINTENTOS: "3"
+          MAX_TIEMPO_RESPUESTA: "2.0"
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          ARCHIVO_METRICAS: metricas-monitoreo.json
+
+      - name: Guardar métricas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitoreo-${{ github.run_id }}
+          path: metricas-monitoreo.json
+          retention-days: 30
+          if-no-files-found: ignore

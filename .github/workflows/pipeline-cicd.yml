@@ -1,0 +1,262 @@
+# =============================================================================
+# Pipeline de liberación y despliegue continuo — Consultorio Digital
+#
+# Flujo:
+#   1. Integración ........ pruebas unitarias + build de producción
+#   2. Staging ............ despliegue al entorno de liberación (Vercel Preview)
+#   3. Pruebas staging .... pruebas de humo contra el entorno de liberación
+#   4. Producción ......... despliegue candidato (sin dominio) + pruebas
+#   5. Liberación ......... se promueve el candidato al dominio público y se verifica
+#
+# En pull requests solo corren las etapas 1 a 3 (cada PR obtiene su propio
+# entorno de liberación). En push a main corre el flujo completo.
+# Ejecutándolo manualmente con "rollback_url" se regresa producción a un
+# despliegue anterior.
+# =============================================================================
+name: Pipeline CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rollback_url:
+        description: "Opcional: URL de un despliegue anterior para hacer rollback de producción"
+        required: false
+        default: ""
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22"
+  VERCEL_CLI_VERSION: "66.6.0"
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  integracion:
+    name: 1 · Integración (pruebas + build)
+    if: ${{ !inputs.rollback_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v5
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Pruebas unitarias (Vitest)
+        run: npm run test:ci
+
+      - name: Generar entorno
+        if: ${{ env.SUPABASE_URL != '' }}
+        run: bash scripts/generar-entorno.sh
+        env:
+          APP_ENV: staging
+
+      - name: Build de producción
+        run: npm run build:prod
+
+      - name: Reporte del build
+        run: |
+          {
+            echo "### Build de producción"
+            echo "| Métrica | Valor |"
+            echo "|---|---|"
+            echo "| Tamaño total | $(du -sh dist/consultorio-digital/browser | cut -f1) |"
+            echo "| Archivos JS | $(find dist/consultorio-digital/browser -maxdepth 1 -name "*.js" | wc -l) |"
+            echo "| Commit | \`${GITHUB_SHA::7}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guardar build como evidencia
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: dist/consultorio-digital/browser
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  desplegar-staging:
+    name: 2 · Despliegue a staging
+    needs: integracion
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: staging
+      url: ${{ steps.despliegue.outputs.url }}
+    outputs:
+      url: ${{ steps.despliegue.outputs.url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Instalar Vercel CLI
+        run: npm install --global vercel@${{ env.VERCEL_CLI_VERSION }}
+
+      - name: Generar entorno de liberación
+        run: bash scripts/generar-entorno.sh
+        env:
+          APP_ENV: staging
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+
+      - name: Desplegar en Vercel (preview)
+        id: despliegue
+        run: bash scripts/desplegar.sh staging
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  pruebas-staging:
+    name: 3 · Pruebas en staging
+    needs: desplegar-staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Pruebas de humo en el entorno de liberación
+        run: bash scripts/pruebas-humo.sh "${{ needs.desplegar-staging.outputs.url }}"
+        env:
+          COMMIT_ESPERADO: ${{ github.sha }}
+          AMBIENTE_ESPERADO: staging
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+
+  # ---------------------------------------------------------------------------
+  desplegar-produccion:
+    name: 4 · Despliegue candidato a producción
+    needs: pruebas-staging
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    outputs:
+      url: ${{ steps.despliegue.outputs.url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Instalar Vercel CLI
+        run: npm install --global vercel@${{ env.VERCEL_CLI_VERSION }}
+
+      - name: Generar entorno de producción
+        run: bash scripts/generar-entorno.sh
+        env:
+          APP_ENV: production
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+
+      - name: Desplegar candidato (sin dominio público)
+        id: despliegue
+        run: bash scripts/desplegar.sh production
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Pruebas de humo sobre el candidato
+        run: bash scripts/pruebas-humo.sh "${{ steps.despliegue.outputs.url }}"
+        env:
+          COMMIT_ESPERADO: ${{ github.sha }}
+          AMBIENTE_ESPERADO: production
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+
+  # ---------------------------------------------------------------------------
+  liberar-produccion:
+    name: 5 · Liberación a producción
+    needs: desplegar-produccion
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Instalar Vercel CLI
+        run: npm install --global vercel@${{ env.VERCEL_CLI_VERSION }}
+
+      - name: Promover el candidato al dominio público
+        run: bash scripts/liberar.sh "${{ needs.desplegar-produccion.outputs.url }}"
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Verificación final en producción
+        run: bash scripts/pruebas-humo.sh "${{ vars.PRODUCTION_URL }}"
+        env:
+          COMMIT_ESPERADO: ${{ github.sha }}
+          AMBIENTE_ESPERADO: production
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          ARCHIVO_METRICAS: metricas-liberacion.json
+
+      - name: Guardar métricas de la liberación
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metricas-liberacion-${{ github.sha }}
+          path: metricas-liberacion.json
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  rollback:
+    name: Rollback de producción (manual)
+    if: ${{ inputs.rollback_url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Instalar Vercel CLI
+        run: npm install --global vercel@${{ env.VERCEL_CLI_VERSION }}
+
+      - name: Regresar producción al despliegue indicado
+        run: bash scripts/liberar.sh "$URL_ROLLBACK"
+        env:
+          URL_ROLLBACK: ${{ inputs.rollback_url }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+
+      - name: Verificar producción después del rollback
+        run: bash scripts/pruebas-humo.sh "${{ vars.PRODUCTION_URL }}"
+        env:
+          AMBIENTE_ESPERADO: production

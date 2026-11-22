@@ -187,3 +187,11 @@ ng build
 ```bash
 ng test
 ```
+
+---
+
+## Liberación y despliegue continuo (CI/CD)
+
+Este repositorio incluye un pipeline con **GitHub Actions + Vercel**: pruebas unitarias,
+build, despliegue a un entorno de liberación (staging), pruebas de humo, despliegue a
+producción y monitoreo. La configuración y el uso están en [`docs/CICD.md`](docs/CICD.md).
